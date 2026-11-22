@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -100,4 +101,53 @@ for o in [p for q, r in s if t]:
 
 	// Output:
 	// a a b c d e f g h i j k l m n o p q r s t u v w x y z
+}
+
+func TestTypeSyntaxWalk(t *testing.T) {
+	const src = `
+type Alias = list[int]
+type Fn = Callable[..., bool]
+x: int = 1
+y: str
+def f[T](a: T) -> T:
+	return cast(T, a)
+`
+	f, err := typeOptions().Parse("type.star", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	counts := make(map[string]int)
+	var idents []string
+	syntax.Walk(f, func(n syntax.Node) bool {
+		if n == nil {
+			return true
+		}
+		counts[fmt.Sprintf("%T", n)]++
+		if id, ok := n.(*syntax.Ident); ok {
+			idents = append(idents, id.Name)
+		}
+		return true
+	})
+
+	for _, want := range []string{
+		"*syntax.TypeAliasStmt",
+		"*syntax.VarStmt",
+		"*syntax.CastExpr",
+		"*syntax.IndexExpr",
+		"*syntax.EllipsisExpr",
+	} {
+		if counts[want] == 0 {
+			t.Errorf("Walk did not visit %s", want)
+		}
+	}
+
+	// Annotations must be traversed, including those on parameters
+	// and return types.
+	for _, want := range []string{"int", "list", "Callable", "bool", "str", "T"} {
+		found := slices.Contains(idents, want)
+		if !found {
+			t.Errorf("Walk did not visit identifier %q; ids: %v", want, idents)
+		}
+	}
 }

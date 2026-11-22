@@ -204,18 +204,29 @@ func (p *parser) parseStmt(stmts []Stmt) []Stmt {
 func (p *parser) parseDefStmt() Stmt {
 	defpos := p.nextToken() // consume DEF
 	id := p.parseIdent()
+	var typeParams []*Ident
+	if p.typeAnnotationsEnabled() && p.tok == LBRACK {
+		typeParams = p.parseTypeParams()
+	}
 	lparen := p.consume(LPAREN)
-	params := p.parseParams()
+	params := p.parseParams(p.typeAnnotationsEnabled())
 	rparen := p.consume(RPAREN)
+	var returnType Expr
+	if p.typeAnnotationsEnabled() && p.tok == ARROW {
+		p.nextToken() // consume ARROW
+		returnType = p.parseTypeExpr()
+	}
 	p.consume(COLON)
 	body := p.parseSuite()
 	return &DefStmt{
-		Def:    defpos,
-		Name:   id,
-		Lparen: lparen,
-		Params: params,
-		Rparen: rparen,
-		Body:   body,
+		Def:        defpos,
+		Name:       id,
+		TypeParams: typeParams,
+		Lparen:     lparen,
+		Params:     params,
+		Rparen:     rparen,
+		ReturnType: returnType,
+		Body:       body,
 	}
 }
 
@@ -326,6 +337,8 @@ func (p *parser) parseSimpleStmt(stmts []Stmt, consumeNL bool) []Stmt {
 //
 //	| PASS | BREAK | CONTINUE
 //	| LOAD ...
+//	| TYPE identifier ['[' type_params ']'] '=' type_expr   // type alias
+//	| expr ':' type_expr ['=' expr]                         // var or typed assignment
 //	| expr ('=' | '+=' | '-=' | '*=' | '/=' | '%=' | '&=' | '|=' | '^=' | '<<=' | '>>=') expr   // assign
 //	| expr
 func (p *parser) parseSmallStmt() Stmt {
@@ -349,6 +362,26 @@ func (p *parser) parseSmallStmt() Stmt {
 
 	// Assignment
 	x := p.parseExpr(false)
+
+	// Type annotation syntax: var statement, typed assignment, or type alias.
+	if p.typeAnnotationsEnabled() {
+		if id, ok := x.(*Ident); ok {
+			if id.Name == "type" && p.tok == IDENT {
+				return p.parseTypeAliasStmt(id.NamePos)
+			}
+			if p.tok == COLON {
+				p.nextToken() // consume COLON
+				id.Type = p.parseTypeExpr()
+				if p.tok == EQ {
+					op := p.nextToken() // consume EQ
+					rhs := p.parseExpr(false)
+					return &AssignStmt{OpPos: op, Op: EQ, LHS: id, RHS: rhs}
+				}
+				return &VarStmt{Name: id}
+			}
+		}
+	}
+
 	switch p.tok {
 	case EQ, PLUS_EQ, MINUS_EQ, STAR_EQ, SLASH_EQ, SLASHSLASH_EQ, PERCENT_EQ, AMP_EQ, PIPE_EQ, CIRCUMFLEX_EQ, LTLT_EQ, GTGT_EQ:
 		op := p.tok
@@ -448,6 +481,9 @@ func (p *parser) parseIdent() *Ident {
 	if p.tok != IDENT {
 		p.in.error(p.in.pos, "not an identifier")
 	}
+	if p.typeAnnotationsEnabled() && (p.tokval.raw == "cast" || p.tokval.raw == "isinstance") {
+		p.in.errorf(p.tokval.pos, "%s is a reserved word when type annotations are enabled", p.tokval.raw)
+	}
 	id := &Ident{
 		NamePos: p.tokval.pos,
 		Name:    p.tokval.raw,
@@ -469,10 +505,12 @@ func (p *parser) consume(t Token) Position {
 //
 // param = IDENT
 //
+//	| IDENT ':' typeExpr
 //	| IDENT EQ test
+//	| IDENT ':' typeExpr EQ test
 //	| STAR
-//	| STAR IDENT
-//	| STARSTAR IDENT
+//	| STAR IDENT [':' typeExpr]
+//	| STARSTAR IDENT [':' typeExpr]
 //
 // parseParams parses a parameter list.  The resulting expressions are of the form:
 //
@@ -481,7 +519,10 @@ func (p *parser) consume(t Token) Position {
 //	*Unary{Op: STAR}                                *
 //	*Unary{Op: STAR, X: *Ident}                     *args
 //	*Unary{Op: STARSTAR, X: *Ident}                 **kwargs
-func (p *parser) parseParams() []Expr {
+//
+// If allowTypes is true, parameter names may have type annotations,
+// which are stored in the Ident's Type field.
+func (p *parser) parseParams(allowTypes bool) []Expr {
 	var params []Expr
 	for p.tok != RPAREN && p.tok != COLON && p.tok != EOF {
 		if len(params) > 0 {
@@ -497,7 +538,12 @@ func (p *parser) parseParams() []Expr {
 			pos := p.nextToken()
 			var x Expr
 			if op == STARSTAR || p.tok == IDENT {
-				x = p.parseIdent()
+				id := p.parseIdent()
+				if allowTypes && p.tok == COLON {
+					p.nextToken() // consume COLON
+					id.Type = p.parseTypeExpr()
+				}
+				x = id
 			}
 			params = append(params, &UnaryExpr{
 				OpPos: pos,
@@ -508,8 +554,14 @@ func (p *parser) parseParams() []Expr {
 		}
 
 		// IDENT
+		// IDENT: type
 		// IDENT = test
+		// IDENT: type = test
 		id := p.parseIdent()
+		if allowTypes && p.tok == COLON {
+			p.nextToken() // consume COLON
+			id.Type = p.parseTypeExpr()
+		}
 		if p.tok == EQ { // default value
 			eq := p.nextToken()
 			dflt := p.parseTest()
@@ -525,6 +577,218 @@ func (p *parser) parseParams() []Expr {
 		params = append(params, id)
 	}
 	return params
+}
+
+func (p *parser) typeAnnotationsEnabled() bool { return p.options != nil && p.options.TypeAnnotations }
+
+// type_params = '[' identifier {',' identifier} [','] ']'
+func (p *parser) parseTypeParams() []*Ident {
+	lbr := p.nextToken() // consume '['
+	var params []*Ident
+	for p.tok != RBRACK && p.tok != EOF {
+		if len(params) > 0 {
+			p.consume(COMMA)
+		}
+		if p.tok == RBRACK {
+			break
+		}
+		params = append(params, p.parseIdent())
+	}
+	p.consume(RBRACK)
+	if len(params) == 0 {
+		p.in.error(lbr, "type parameter list must not be empty")
+	}
+	return params
+}
+
+// type_alias = 'type' identifier ['[' type_params ']'] '=' type_expr
+func (p *parser) parseTypeAliasStmt(typePos Position) Stmt {
+	name := p.parseIdent()
+	var typeParams []*Ident
+	if p.tok == LBRACK {
+		typeParams = p.parseTypeParams()
+	}
+	eq := p.consume(EQ)
+	value := p.parseTypeExpr()
+	return &TypeAliasStmt{
+		TypePos:    typePos,
+		Name:       name,
+		TypeParams: typeParams,
+		Eq:         eq,
+		Value:      value,
+	}
+}
+
+// type_expr = type_atom {'|' type_atom}
+func (p *parser) parseTypeExpr() Expr {
+	p.enter()
+	defer p.leave()
+
+	x := p.parseTypeAtom()
+	for p.tok == PIPE {
+		opPos := p.nextToken()
+		y := p.parseTypeAtom()
+		x = &BinaryExpr{X: x, OpPos: opPos, Op: PIPE, Y: y}
+	}
+	return x
+}
+
+// type_atom = type_name ['[' type_arguments ']'] | '(' [type_exprs] ')'
+func (p *parser) parseTypeAtom() Expr {
+	switch p.tok {
+	case IDENT:
+		return p.parseTypeApplication()
+	case LPAREN:
+		return p.parseTypeParen()
+	}
+	p.in.errorf(p.tokval.pos, "got %#v, want type expression", p.tok)
+	panic("unreachable")
+}
+
+// type_name = identifier {'.' identifier}
+func (p *parser) parseTypeName() Expr {
+	var x Expr = p.parseIdent()
+	for p.tok == DOT {
+		dot := p.nextToken()
+		name := p.parseIdent()
+		x = &DotExpr{Dot: dot, X: x, Name: name}
+	}
+	return x
+}
+
+// type_application = type_name '[' type_argument {',' type_argument} ']'
+func (p *parser) parseTypeApplication() Expr {
+	x := p.parseTypeName()
+	if p.tok != LBRACK {
+		return x
+	}
+	lbrack := p.nextToken() // consume '['
+	if p.tok == RBRACK {
+		p.in.error(lbrack, "type application must have at least one argument")
+	}
+	args := []Expr{p.parseTypeArgument()}
+	for p.tok == COMMA {
+		comma := p.nextToken()
+		if p.tok == RBRACK {
+			p.in.error(comma, "trailing comma not allowed in type application")
+		}
+		args = append(args, p.parseTypeArgument())
+	}
+	rbrack := p.consume(RBRACK)
+	var y Expr
+	if len(args) == 1 {
+		y = args[0]
+	} else {
+		y = &TupleExpr{List: args}
+	}
+	return &IndexExpr{X: x, Lbrack: lbrack, Y: y, Rbrack: rbrack}
+}
+
+// type_argument = type_expr | type_list | type_dict | string | int | '...'
+func (p *parser) parseTypeArgument() Expr {
+	switch p.tok {
+	case STRING, INT:
+		return p.parsePrimary()
+	case ELLIPSIS:
+		pos := p.nextToken()
+		return &EllipsisExpr{Ellipsis: pos}
+	case LBRACK:
+		return p.parseTypeList()
+	case LBRACE:
+		return p.parseTypeDict()
+	default:
+		return p.parseTypeExpr()
+	}
+}
+
+// type_list = '[' [type_expr [',']] ']'
+func (p *parser) parseTypeList() Expr {
+	lbrack := p.nextToken() // consume '['
+	var list []Expr
+	if p.tok != RBRACK {
+		list = append(list, p.parseTypeExpr())
+		if p.tok == COMMA {
+			p.nextToken() // trailing comma
+		}
+	}
+	rbrack := p.consume(RBRACK)
+	return &ListExpr{Lbrack: lbrack, List: list, Rbrack: rbrack}
+}
+
+// type_dict = '{' [type_dict_entry [',']] '}'
+// type_dict_entry = string ':' type_expr
+func (p *parser) parseTypeDict() Expr {
+	lbrace := p.nextToken() // consume '{'
+	var entries []Expr
+	if p.tok != RBRACE {
+		if p.tok != STRING {
+			p.in.errorf(p.tokval.pos, "type dict key must be a string literal")
+		}
+		key := p.parsePrimary()
+		colon := p.consume(COLON)
+		value := p.parseTypeExpr()
+		entries = append(entries, &DictEntry{Key: key, Colon: colon, Value: value})
+		if p.tok == COMMA {
+			p.nextToken() // trailing comma
+		}
+	}
+	rbrace := p.consume(RBRACE)
+	return &DictExpr{Lbrace: lbrace, List: entries, Rbrace: rbrace}
+}
+
+// type_paren = '(' [type_expr {',' type_expr} [',']] ')'
+func (p *parser) parseTypeParen() Expr {
+	lparen := p.nextToken() // consume '('
+	if p.tok == RPAREN {
+		rparen := p.nextToken()
+		return &TupleExpr{Lparen: lparen, Rparen: rparen}
+	}
+	list := []Expr{p.parseTypeExpr()}
+	tuple := false
+	for p.tok == COMMA {
+		tuple = true
+		p.nextToken()
+		if p.tok == RPAREN {
+			break // trailing comma
+		}
+		list = append(list, p.parseTypeExpr())
+	}
+	rparen := p.consume(RPAREN)
+	var x Expr
+	if tuple {
+		x = &TupleExpr{List: list}
+	} else {
+		x = list[0]
+	}
+	return &ParenExpr{Lparen: lparen, X: x, Rparen: rparen}
+}
+
+// cast_expr = 'cast' '(' type_expr ',' test [','] ')'
+func (p *parser) parseCastExpr() Expr {
+	cast := p.nextToken() // consume 'cast'
+	lparen := p.consume(LPAREN)
+	typ := p.parseTypeExpr()
+	p.consume(COMMA)
+	x := p.parseTest()
+	if p.tok == COMMA {
+		p.nextToken() // trailing comma
+	}
+	rparen := p.consume(RPAREN)
+	return &CastExpr{Cast: cast, Lparen: lparen, Type: typ, X: x, Rparen: rparen}
+}
+
+// isinstance_expr = 'isinstance' '(' test ',' type_expr [','] ')'
+func (p *parser) parseIsInstanceExpr() Expr {
+	pos := p.nextToken() // consume 'isinstance'
+	lparen := p.consume(LPAREN)
+	x := p.parseTest()
+	p.consume(COMMA)
+	typ := p.parseTypeExpr()
+	if p.tok == COMMA {
+		p.nextToken() // trailing comma
+	}
+	rparen := p.consume(RPAREN)
+	return &IsInstanceExpr{IsInstance: pos, Lparen: lparen, X: x, Type: typ, Rparen: rparen}
 }
 
 // parseExpr parses an expression, possible consisting of a
@@ -604,7 +868,7 @@ func (p *parser) parseLambda(allowCond bool) Expr {
 	lambda := p.nextToken()
 	var params []Expr
 	if p.tok != COLON {
-		params = p.parseParams()
+		params = p.parseParams(false)
 	}
 	p.consume(COLON)
 
@@ -844,6 +1108,14 @@ func (p *parser) parsePrimary() Expr {
 
 	switch p.tok {
 	case IDENT:
+		if p.typeAnnotationsEnabled() {
+			switch p.tokval.raw {
+			case "cast":
+				return p.parseCastExpr()
+			case "isinstance":
+				return p.parseIsInstanceExpr()
+			}
+		}
 		return p.parseIdent()
 
 	case INT, FLOAT, STRING, BYTES:

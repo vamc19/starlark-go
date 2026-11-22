@@ -630,3 +630,278 @@ func TestParserCallGraphCycles(t *testing.T) {
 	}
 
 }
+
+// typeOptions returns options with type annotation syntax enabled.
+func typeOptions() *syntax.FileOptions {
+	return &syntax.FileOptions{TypeAnnotations: true}
+}
+
+func TestTypeExprParseTrees(t *testing.T) {
+	// Type expressions occur only in type positions, so test them
+	// through a cast expression and inspect its Type field.
+	for _, test := range []struct {
+		input, want string
+	}{
+		{`int`, `int`},
+		{`int | None`, `(BinaryExpr X=int Op=| Y=None)`},
+		{`list[int]`, `(IndexExpr X=list Y=int)`},
+		{`dict[str, int]`, `(IndexExpr X=dict Y=(TupleExpr List=(str int)))`},
+		{`Callable[..., bool]`, `(IndexExpr X=Callable Y=(TupleExpr List=((EllipsisExpr) bool)))`},
+		{`foo.bar.Baz`, `(DotExpr X=(DotExpr X=foo Name=bar) Name=Baz)`},
+		{`(int)`, `(ParenExpr X=int)`},
+		{`(int,)`, `(ParenExpr X=(TupleExpr List=(int)))`},
+		{`(int, str)`, `(ParenExpr X=(TupleExpr List=(int str)))`},
+		{`()`, `(TupleExpr)`},
+		{`(int,) | None`, `(BinaryExpr X=(ParenExpr X=(TupleExpr List=(int))) Op=| Y=None)`},
+		{`list[[int]]`, `(IndexExpr X=list Y=(ListExpr List=(int)))`},
+		{`struct[{"x": str}]`, `(IndexExpr X=struct Y=(DictExpr List=((DictEntry Key="x" Value=str))))`},
+		{`Foo[42]`, `(IndexExpr X=Foo Y=42)`},
+		{`Foo["x"]`, `(IndexExpr X=Foo Y="x")`},
+	} {
+		expr, err := typeOptions().ParseExpr("type.star", `cast(`+test.input+`, x)`, 0)
+		if err != nil {
+			t.Errorf("parse cast(%s, x) failed: %v", test.input, stripPos(err))
+			continue
+		}
+		cast, ok := expr.(*syntax.CastExpr)
+		if !ok {
+			t.Errorf("parse cast(%s, x) = %T, want *syntax.CastExpr", test.input, expr)
+			continue
+		}
+		if got := treeString(cast.Type); got != test.want {
+			t.Errorf("type %s = %s, want %s", test.input, got, test.want)
+		}
+	}
+
+	// Check cast/isinstance
+	for _, test := range []struct {
+		input, want string
+	}{
+		{`cast(int, x)`, `(CastExpr Type=int X=x)`},
+		{`cast(int | None, x,)`, `(CastExpr Type=(BinaryExpr X=int Op=| Y=None) X=x)`},
+		{`isinstance(x, list | dict | str)`,
+			`(IsInstanceExpr X=x Type=(BinaryExpr X=(BinaryExpr X=list Op=| Y=dict) Op=| Y=str))`},
+		{`isinstance(x, int,)`, `(IsInstanceExpr X=x Type=int)`},
+	} {
+		expr, err := typeOptions().ParseExpr("type.star", test.input, 0)
+		var got string
+		if err != nil {
+			got = stripPos(err)
+		} else {
+			got = treeString(expr)
+		}
+		if got != test.want {
+			t.Errorf("parse %s = %s, want %s", test.input, got, test.want)
+		}
+	}
+}
+
+func TestTypeExprParseErrors(t *testing.T) {
+	for _, test := range []struct {
+		src, want string
+	}{
+		{`cast(Foo[], x)`, "type application must have at least one argument"},
+		{`cast(Foo[int,], x)`, "trailing comma not allowed in type application"},
+		{`cast(list[int][str], x)`, "want ','"},
+		{`cast(int)`, "want ','"},
+		{`cast(int, x, y)`, "want ')'"},
+		{`isinstance(x)`, "want ','"},
+		{`isinstance(x, int, y)`, "want ')'"},
+	} {
+		_, err := typeOptions().ParseExpr("type.star", test.src, 0)
+		if err == nil {
+			t.Errorf("parse %s succeeded, want error %q", test.src, test.want)
+			continue
+		}
+		if got := stripPos(err); !strings.Contains(got, test.want) {
+			t.Errorf("parse %s error = %q, want substring %q", test.src, got, test.want)
+		}
+	}
+}
+
+func TestTypeStmtParseTrees(t *testing.T) {
+	for _, test := range []struct {
+		input, want string
+	}{
+		{`x: int = 1`, `(AssignStmt Op== LHS=x RHS=1)`},
+		{`x: int | None`, `(VarStmt Name=x)`},
+		{`x: int = 1, 2`, `(AssignStmt Op== LHS=x RHS=(TupleExpr List=(1 2)))`},
+		{`type Numeric = int | float`,
+			`(TypeAliasStmt Name=Numeric Value=(BinaryExpr X=int Op=| Y=float))`},
+		{`type OptionalDict[K, V] = dict[K, V] | None`,
+			`(TypeAliasStmt Name=OptionalDict TypeParams=(K V) Value=(BinaryExpr X=(IndexExpr X=dict Y=(TupleExpr List=(K V))) Op=| Y=None))`},
+		{`def f(x: int, *args: str, **kwargs: bool) -> int: pass`,
+			`(DefStmt Name=f Params=(x (UnaryExpr Op=* X=args) (UnaryExpr Op=** X=kwargs)) ReturnType=int Body=((BranchStmt Token=pass)))`},
+		{`def f[T](a: list[T]) -> T: return a[0]`,
+			`(DefStmt Name=f TypeParams=(T) Params=(a) ReturnType=T Body=((ReturnStmt Result=(IndexExpr X=a Y=0))))`},
+		{`def f[T,](a: T): pass`,
+			`(DefStmt Name=f TypeParams=(T) Params=(a) Body=((BranchStmt Token=pass)))`},
+	} {
+		f, err := typeOptions().Parse("type.star", test.input, 0)
+		if err != nil {
+			t.Errorf("parse %s failed: %v", test.input, stripPos(err))
+			continue
+		}
+		if got := treeString(f.Stmts[0]); got != test.want {
+			t.Errorf("parse %s = %s, want %s", test.input, got, test.want)
+		}
+	}
+}
+
+// TestTypeAnnotationFields checks the annotation fields that treeString omits.
+func TestTypeAnnotationFields(t *testing.T) {
+	f, err := typeOptions().Parse("type.star", `def f(x: int, *args: str, **kwargs: bool) -> int: pass`, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	def := f.Stmts[0].(*syntax.DefStmt)
+	if got := treeString(def.ReturnType); got != "int" {
+		t.Errorf("return type = %s, want int", got)
+	}
+	params := def.Params
+	if got := treeString(params[0].(*syntax.Ident).Type); got != "int" {
+		t.Errorf("x type = %s, want int", got)
+	}
+	if got := treeString(params[1].(*syntax.UnaryExpr).X.(*syntax.Ident).Type); got != "str" {
+		t.Errorf("*args type = %s, want str", got)
+	}
+	if got := treeString(params[2].(*syntax.UnaryExpr).X.(*syntax.Ident).Type); got != "bool" {
+		t.Errorf("**kwargs type = %s, want bool", got)
+	}
+
+	f, err = typeOptions().Parse("type.star", `x: int = 1`, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lhs := f.Stmts[0].(*syntax.AssignStmt).LHS.(*syntax.Ident)
+	if got := treeString(lhs.Type); got != "int" {
+		t.Errorf("typed assignment type = %s, want int", got)
+	}
+
+	f, err = typeOptions().Parse("type.star", `x: int | None`, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decl := f.Stmts[0].(*syntax.VarStmt)
+	if got := treeString(decl.Name.Type); got != `(BinaryExpr X=int Op=| Y=None)` {
+		t.Errorf("var statement type = %s, want int | None", got)
+	}
+}
+
+func TestTypeStmtParseErrors(t *testing.T) {
+	for _, test := range []struct {
+		input, want string
+	}{
+		{`def f[](x): pass`, "type parameter list must not be empty"},
+		{`x.y: int = 1`, "want newline"},
+		{`cast = 1`, "want '('"},
+		{`def f(x: int = 1, *, y: str = "a"): pass`, ""}, // valid
+	} {
+		_, err := typeOptions().Parse("type.star", test.input, 0)
+		if test.want == "" {
+			if err != nil {
+				t.Errorf("parse %s failed: %v", test.input, stripPos(err))
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("parse %s succeeded, want error %q", test.input, test.want)
+			continue
+		}
+		if got := stripPos(err); !strings.Contains(got, test.want) {
+			t.Errorf("parse %s error = %q, want substring %q", test.input, got, test.want)
+		}
+	}
+}
+
+// TestTypeSyntaxDisabled verifies that the new syntax is not accepted
+// unless FileOptions.TypeAnnotations is set, preserving backward compatibility.
+func TestTypeSyntaxDisabled(t *testing.T) {
+	opts := &syntax.FileOptions{}
+
+	// cast(...) is an ordinary call expression when type syntax is disabled.
+	expr, err := opts.ParseExpr("f.star", `cast(int, x)`, 0)
+	if err != nil {
+		t.Fatalf("parse cast(int, x): %v", err)
+	}
+	if _, ok := expr.(*syntax.CallExpr); !ok {
+		t.Errorf("cast(int, x) = %T, want *syntax.CallExpr", expr)
+	}
+
+	for _, src := range []string{
+		`x: int`,
+		`x: int = 1`,
+		`type X = int`,
+		"def f(x: int): pass",
+		"def f[T](): pass",
+		"def f() -> int: pass",
+	} {
+		if _, err := opts.Parse("f.star", src, 0); err == nil {
+			t.Errorf("parse %s succeeded, want syntax error", src)
+		}
+	}
+}
+
+// TestDefaultParseTreesUnchanged checks a few parse trees that are
+// sensitive to the new '->' and '...' tokens.
+func TestDefaultParseTreesUnchanged(t *testing.T) {
+	for _, test := range []struct {
+		input, want string
+	}{
+		{`x = a - b > c`, `(AssignStmt Op== LHS=x RHS=(BinaryExpr X=(BinaryExpr X=a Op=- Y=b) Op=> Y=c))`},
+		{`x = a - -b`, `(AssignStmt Op== LHS=x RHS=(BinaryExpr X=a Op=- Y=(UnaryExpr Op=- X=b)))`},
+		{`x = a > -b`, `(AssignStmt Op== LHS=x RHS=(BinaryExpr X=a Op=> Y=(UnaryExpr Op=- X=b)))`},
+		{`x = a.b.c`, `(AssignStmt Op== LHS=x RHS=(DotExpr X=(DotExpr X=a Name=b) Name=c))`},
+		{`f(a, b=c, *d, **e)`, `(ExprStmt X=(CallExpr Fn=f Args=(a (BinaryExpr X=b Op== Y=c) (UnaryExpr Op=* X=d) (UnaryExpr Op=** X=e))))`},
+		{`lambda x, y=1: x`, `(ExprStmt X=(LambdaExpr Params=(x (BinaryExpr X=y Op== Y=1)) Body=x))`},
+		{`x[1:2]`, `(ExprStmt X=(SliceExpr X=x Lo=1 Hi=2))`},
+	} {
+		f, err := new(syntax.FileOptions).Parse("plain.star", test.input, 0)
+		if err != nil {
+			t.Errorf("parse %s failed: %v", test.input, err)
+			continue
+		}
+		if got := treeString(f.Stmts[0]); got != test.want {
+			t.Errorf("parse %s = %s, want %s", test.input, got, test.want)
+		}
+	}
+
+	// Numeric literals involving periods must still be recognized.
+	for _, src := range []string{`x = 1.`, `x = .5`, `x = 1.5e3`, `x = 0.`, `x = 1.5e-3`} {
+		if _, err := new(syntax.FileOptions).Parse("plain.star", src, 0); err != nil {
+			t.Errorf("parse %s failed: %v", src, err)
+		}
+	}
+}
+
+// TestTypeNamesUsableAsIdentifiers checks that 'type', 'cast', and
+// 'isinstance' remain ordinary names when type annotations are disabled.
+func TestTypeNamesUsableAsIdentifiers(t *testing.T) {
+	for _, src := range []string{
+		`type = 1`,
+		`type(x)`,
+		`def f(type, cast, isinstance): return cast(type, isinstance)`,
+		`x.type = cast.type + isinstance.type`,
+		`f(cast=1, isinstance=2)`,
+		`load("m", "cast", type="isinstance")`,
+	} {
+		if _, err := new(syntax.FileOptions).Parse("ident.star", src, 0); err != nil {
+			t.Errorf("parse %s failed: %v", src, err)
+		}
+	}
+}
+
+// TestTypeIdentifierAlwaysUsable checks that 'type' never becomes a
+// reserved word, even when type annotations are enabled.
+func TestTypeIdentifierAlwaysUsable(t *testing.T) {
+	for _, src := range []string{
+		`type = 1`,
+		`type(x)`,
+		`def f(type): return type`,
+		`x.type`,
+	} {
+		if _, err := typeOptions().Parse("ident.star", src, 0); err != nil {
+			t.Errorf("parse %s failed: %v", src, err)
+		}
+	}
+}

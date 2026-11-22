@@ -79,6 +79,10 @@ const (
 	GTGT_EQ       // >>=
 	STARSTAR      // **
 
+	// Type annotation tokens
+	ARROW    // ->
+	ELLIPSIS // ...
+
 	// Keywords
 	AND
 	BREAK
@@ -126,6 +130,10 @@ func (tok Token) String() string { return tokenNames[tok] }
 // GoString is like String but quotes punctuation tokens.
 // Use Sprintf("%#v", tok) when constructing error messages.
 func (tok Token) GoString() string {
+	switch tok {
+	case ARROW, ELLIPSIS:
+		return "'" + tokenNames[tok] + "'"
+	}
 	if tok >= PLUS && tok <= STARSTAR {
 		return "'" + tokenNames[tok] + "'"
 	}
@@ -220,6 +228,9 @@ var tokenNames = [...]string{
 	TRY:      "try",
 	WITH:     "with",
 	YIELD:    "yield",
+
+	ARROW:    "->",
+	ELLIPSIS: "...",
 }
 
 // A FilePortion describes the content of a portion of a file.
@@ -748,6 +759,14 @@ start:
 
 	// int or float literal, or period
 	if isdigit(c) || c == '.' {
+		// Ellipsis: three consecutive periods.
+		if c == '.' && len(sc.rest) >= 3 && sc.rest[1] == '.' && sc.rest[2] == '.' {
+			sc.readRune()
+			sc.readRune()
+			sc.readRune()
+			sc.endToken(val)
+			return ELLIPSIS
+		}
 		return sc.scanNumber(val, c)
 	}
 
@@ -814,6 +833,10 @@ start:
 		case '+':
 			return PLUS
 		case '-':
+			if sc.peekRune() == '>' {
+				sc.readRune()
+				return ARROW
+			}
 			return MINUS
 		case '/':
 			if sc.peekRune() == '/' {

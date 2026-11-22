@@ -6,11 +6,14 @@ File = {Statement | newline} eof .
 
 Statement = DefStmt | IfStmt | ForStmt | WhileStmt | SimpleStmt .
 
-DefStmt = 'def' identifier '(' [Parameters [',']] ')' ':' Suite .
+DefStmt = 'def' identifier ['[' TypeParams [','] ']'] '(' [Parameters [',']] ')' ['->' TypeExpr] ':' Suite .
 
 Parameters = Parameter {',' Parameter}.
 
-Parameter = identifier | identifier '=' Test | '*' | '*' identifier | '**' identifier .
+Parameter = identifier [':' TypeExpr] ['=' Test]
+          | '*'
+          | '*' identifier [':' TypeExpr]
+          | '**' identifier [':' TypeExpr] .
 
 IfStmt = 'if' Test ':' Suite {'elif' Test ':' Suite} ['else' ':' Suite] .
 
@@ -28,16 +31,23 @@ SmallStmt = ReturnStmt
           | AssignStmt
           | ExprStmt
           | LoadStmt
+          | TypeAliasStmt
+          | VarStmt
           .
 
 ReturnStmt   = 'return' [Expression] .
 BreakStmt    = 'break' .
 ContinueStmt = 'continue' .
 PassStmt     = 'pass' .
-AssignStmt   = Expression ('=' | '+=' | '-=' | '*=' | '/=' | '//=' | '%=' | '&=' | '|=' | '^=' | '<<=' | '>>=') Expression .
+AssignStmt   = Expression ('=' | '+=' | '-=' | '*=' | '/=' | '//=' | '%=' | '&=' | '|=' | '^=' | '<<=' | '>>=') Expression
+             | identifier ':' TypeExpr '=' Expression
+             .
 ExprStmt     = Expression .
 
 LoadStmt = 'load' '(' string {',' [identifier '='] string} [','] ')' .
+
+TypeAliasStmt = 'type' identifier ['[' TypeParams [','] ']'] '=' TypeExpr .
+VarStmt       = identifier ':' TypeExpr .
 
 Test = LambdaExpr
      | IfExpr
@@ -60,6 +70,7 @@ Operand = identifier
         | int | float | string
         | ListExpr | ListComp
         | DictExpr | DictComp
+        | CastExpr | IsInstanceExpr
         | '(' [Expression [',']] ')'
         | ('-' | '+') PrimaryExpr
         .
@@ -101,6 +112,48 @@ Expression = Test {',' Test} .
 LoopVariables = PrimaryExpr {',' PrimaryExpr} .
 
 
+# Type annotations
+#
+# Grammar below is enabled only when FileOptions.TypeAnnotations is set.
+# 'type' is not a keyword and remains a valid identifier.
+# 'cast' and 'isinstance' are reserved only when type annotations are enabled.
+
+TypeParams = identifier {',' identifier} .
+
+TypeExpr = TypeAtom {'|' TypeAtom} .
+
+TypeExprs = TypeExpr {',' TypeExpr} .
+
+TypeAtom = TypeName
+         | TypeApplication
+         | '(' [TypeExprs [',']] ')'
+         .
+
+TypeName = identifier {'.' identifier} .
+
+TypeApplication = TypeName '[' TypeArguments ']' .
+
+TypeArguments = TypeArgument {',' TypeArgument} .
+
+TypeArgument = TypeExpr
+             | TypeList
+             | TypeDict
+             | string
+             | int
+             | '...'
+             .
+
+TypeList = '[' [TypeExpr [',']] ']' .
+
+TypeDict = '{' [TypeDictEntry [',']] '}' .
+
+TypeDictEntry = string ':' TypeExpr .
+
+CastExpr = 'cast' '(' TypeExpr ',' Argument [','] ')' .
+
+IsInstanceExpr = 'isinstance' '(' Argument ',' TypeExpr [','] ')' .
+
+
 # Notation (similar to Go spec):
 - lowercase and 'quoted' items are lexical tokens.
 - Capitalized names denote grammar productions.
@@ -114,7 +167,7 @@ LoopVariables = PrimaryExpr {',' PrimaryExpr} .
 - spaces: newline, eof, indent, outdent.
 - identifier.
 - literals: string, int, float.
-- plus all quoted tokens such as '+=', 'return'.
+- plus all quoted tokens such as '+=', 'return', '->', '...'.
 
 # Notes:
 - Ambiguity is resolved using operator precedence.

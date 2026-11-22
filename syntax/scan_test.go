@@ -289,6 +289,30 @@ var dataFile = func(pkgdir, filename string) string {
 	return filepath.Join(build.Default.GOPATH, "src/go.starlark.net", pkgdir, filename)
 }
 
+func TestScanTypeTokens(t *testing.T) {
+	for _, test := range []struct {
+		input, want string
+	}{
+		{`->`, `-> EOF`},
+		{`...`, `... EOF`},
+		{`a->b`, `a -> b EOF`},
+		{`a - > b`, `a - > b EOF`},
+		{`x = ...`, `x = ... EOF`},
+		{`.1`, `1.000000e-01 EOF`},
+		{`0.`, `0.000000e+00 EOF`},
+		{`1.`, `1.000000e+00 EOF`},
+	} {
+		got, err := scan(test.input)
+		if err != nil {
+			t.Errorf("scan %s failed: %v", test.input, err)
+			continue
+		}
+		if got != test.want {
+			t.Errorf("scan %s = %s, want %s", test.input, got, test.want)
+		}
+	}
+}
+
 func BenchmarkScan(b *testing.B) {
 	filename := dataFile("syntax", "testdata/scan.star")
 	b.StopTimer()

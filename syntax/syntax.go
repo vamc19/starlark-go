@@ -89,21 +89,24 @@ type Stmt interface {
 	stmt()
 }
 
-func (*AssignStmt) stmt() {}
-func (*BranchStmt) stmt() {}
-func (*DefStmt) stmt()    {}
-func (*ExprStmt) stmt()   {}
-func (*ForStmt) stmt()    {}
-func (*WhileStmt) stmt()  {}
-func (*IfStmt) stmt()     {}
-func (*LoadStmt) stmt()   {}
-func (*ReturnStmt) stmt() {}
+func (*AssignStmt) stmt()    {}
+func (*BranchStmt) stmt()    {}
+func (*DefStmt) stmt()       {}
+func (*ExprStmt) stmt()      {}
+func (*ForStmt) stmt()       {}
+func (*WhileStmt) stmt()     {}
+func (*IfStmt) stmt()        {}
+func (*LoadStmt) stmt()      {}
+func (*ReturnStmt) stmt()    {}
+func (*TypeAliasStmt) stmt() {}
+func (*VarStmt) stmt()       {}
 
 // An AssignStmt represents an assignment:
 //
 //	x = 0
 //	x, y = y, x
 //	x += 1
+//	x: int = 0
 type AssignStmt struct {
 	commentsRef
 	OpPos Position
@@ -118,15 +121,58 @@ func (x *AssignStmt) Span() (start, end Position) {
 	return
 }
 
+// A VarStmt declares a variable and its type without assigning a value:
+//
+//	x: int
+//
+// The declared type is stored in Name.Type.
+type VarStmt struct {
+	commentsRef
+	Name *Ident
+}
+
+func (x *VarStmt) Span() (start, end Position) {
+	start = x.Name.NamePos
+	if x.Name.Type != nil {
+		_, end = x.Name.Type.Span()
+	} else {
+		_, end = x.Name.Span()
+	}
+	return
+}
+
+// A TypeAliasStmt binds a type expression to a name:
+//
+//	type Numeric = int | float
+//	type OptionalDict[K, V] = dict[K, V] | None
+//
+// A type alias is permitted only at top level of a file.
+type TypeAliasStmt struct {
+	commentsRef
+	TypePos    Position // position of 'type'
+	Name       *Ident
+	TypeParams []*Ident // optional type parameters
+	Eq         Position
+	Value      Expr // the aliased type expression
+}
+
+func (x *TypeAliasStmt) Span() (start, end Position) {
+	start = x.TypePos
+	_, end = x.Value.Span()
+	return
+}
+
 // A DefStmt represents a function definition.
 type DefStmt struct {
 	commentsRef
-	Def    Position
-	Name   *Ident
-	Lparen Position
-	Params []Expr // param = ident | ident=expr | * | *ident | **ident
-	Rparen Position
-	Body   []Stmt
+	Def        Position
+	Name       *Ident
+	TypeParams []*Ident // optional type parameters, as in def f[T](...)
+	Lparen     Position
+	Params     []Expr // param = ident | ident=expr | * | *ident | **ident
+	Rparen     Position
+	ReturnType Expr // optional, as in def f(...) -> int
+	Body       []Stmt
 
 	Function any // a *resolve.Function, set by resolver
 }
@@ -222,28 +268,32 @@ type Expr interface {
 	expr()
 }
 
-func (*BinaryExpr) expr()    {}
-func (*CallExpr) expr()      {}
-func (*Comprehension) expr() {}
-func (*CondExpr) expr()      {}
-func (*DictEntry) expr()     {}
-func (*DictExpr) expr()      {}
-func (*DotExpr) expr()       {}
-func (*Ident) expr()         {}
-func (*IndexExpr) expr()     {}
-func (*LambdaExpr) expr()    {}
-func (*ListExpr) expr()      {}
-func (*Literal) expr()       {}
-func (*ParenExpr) expr()     {}
-func (*SliceExpr) expr()     {}
-func (*TupleExpr) expr()     {}
-func (*UnaryExpr) expr()     {}
+func (*BinaryExpr) expr()     {}
+func (*CallExpr) expr()       {}
+func (*CastExpr) expr()       {}
+func (*Comprehension) expr()  {}
+func (*CondExpr) expr()       {}
+func (*DictEntry) expr()      {}
+func (*DictExpr) expr()       {}
+func (*DotExpr) expr()        {}
+func (*EllipsisExpr) expr()   {}
+func (*Ident) expr()          {}
+func (*IndexExpr) expr()      {}
+func (*IsInstanceExpr) expr() {}
+func (*LambdaExpr) expr()     {}
+func (*ListExpr) expr()       {}
+func (*Literal) expr()        {}
+func (*ParenExpr) expr()      {}
+func (*SliceExpr) expr()      {}
+func (*TupleExpr) expr()      {}
+func (*UnaryExpr) expr()      {}
 
 // An Ident represents an identifier.
 type Ident struct {
 	commentsRef
 	NamePos Position
 	Name    string
+	Type    Expr // optional type annotation, if this Ident is a binding
 
 	Binding any // a *resolver.Binding, set by resolver
 }
@@ -263,6 +313,17 @@ type Literal struct {
 
 func (x *Literal) Span() (start, end Position) {
 	return x.TokenPos, x.TokenPos.add(x.Raw)
+}
+
+// An EllipsisExpr represents the "..." token in a type expression,
+// as in Callable[..., bool].
+type EllipsisExpr struct {
+	commentsRef
+	Ellipsis Position
+}
+
+func (x *EllipsisExpr) Span() (start, end Position) {
+	return x.Ellipsis, x.Ellipsis.add("...")
 }
 
 // A ParenExpr represents a parenthesized expression: (X).
@@ -289,6 +350,40 @@ type CallExpr struct {
 func (x *CallExpr) Span() (start, end Position) {
 	start, _ = x.Fn.Span()
 	return start, x.Rparen.add(")")
+}
+
+// A CastExpr informs the type checker of an expression's type:
+//
+//	cast(int, x)
+//
+// At evaluation time it returns the value of X unchanged.
+type CastExpr struct {
+	commentsRef
+	Cast   Position // position of 'cast'
+	Lparen Position
+	Type   Expr // type expression
+	X      Expr // value expression
+	Rparen Position
+}
+
+func (x *CastExpr) Span() (start, end Position) {
+	return x.Cast, x.Rparen.add(")")
+}
+
+// An IsInstanceExpr reports whether a value's type matches a type expression:
+//
+//	isinstance(x, list | None)
+type IsInstanceExpr struct {
+	commentsRef
+	IsInstance Position // position of 'isinstance'
+	Lparen     Position
+	X          Expr // value expression
+	Type       Expr // type expression
+	Rparen     Position
+}
+
+func (x *IsInstanceExpr) Span() (start, end Position) {
+	return x.IsInstance, x.Rparen.add(")")
 }
 
 // A DotExpr represents a field or method selector: X.Name.

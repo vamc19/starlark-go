@@ -28,6 +28,9 @@ type FileOptions struct {
 	GlobalReassign    bool // allow reassignment to top-level names
 	LoadBindsGlobally bool // load creates global not file-local bindings (deprecated)
 
+	// parser
+	TypeAnnotations bool // parse type annotations (resolver/compiler support is not yet implemented)
+
 	// compiler
 	Recursion bool // disable recursion check for functions in this file
 }

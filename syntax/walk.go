@@ -39,10 +39,26 @@ func Walk(n Node, f func(Node) bool) {
 
 	case *DefStmt:
 		Walk(n.Name, f)
+		for _, param := range n.TypeParams {
+			Walk(param, f)
+		}
 		for _, param := range n.Params {
 			Walk(param, f)
 		}
+		if n.ReturnType != nil {
+			Walk(n.ReturnType, f)
+		}
 		walkStmts(n.Body, f)
+
+	case *VarStmt:
+		Walk(n.Name, f)
+
+	case *TypeAliasStmt:
+		Walk(n.Name, f)
+		for _, param := range n.TypeParams {
+			Walk(param, f)
+		}
+		Walk(n.Value, f)
 
 	case *ForStmt:
 		Walk(n.Vars, f)
@@ -67,8 +83,24 @@ func Walk(n Node, f func(Node) bool) {
 			Walk(to, f)
 		}
 
-	case *Ident, *Literal:
+	case *Ident:
+		if n.Type != nil {
+			Walk(n.Type, f)
+		}
+
+	case *Literal:
 		// no-op
+
+	case *EllipsisExpr:
+		// no-op
+
+	case *CastExpr:
+		Walk(n.Type, f)
+		Walk(n.X, f)
+
+	case *IsInstanceExpr:
+		Walk(n.X, f)
+		Walk(n.Type, f)
 
 	case *ListExpr:
 		for _, x := range n.List {
