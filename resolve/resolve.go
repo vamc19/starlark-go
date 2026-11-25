@@ -26,9 +26,9 @@ package resolve // import "go.starlark.net/resolve"
 // of the universal environment across all modules.
 //
 // The lexical environment is a tree of blocks with the file block at
-// its root. The file's child blocks may be of two kinds: functions
-// and comprehensions, and these may have further children of either
-// kind.
+// its root. The file's child blocks may be of three kinds: functions,
+// comprehensions, and type parameter blocks, and these may have further
+// children of any kind.
 //
 // Python-style resolution requires multiple passes because a name is
 // determined to be local to a function only if the function contains a
@@ -144,6 +144,9 @@ func REPLChunk(file *syntax.File, isGlobal, isPredeclared, isUniversal func(name
 
 	r.env.resolveLocalUses()
 
+	// Type annotations are resolved statically and may refer to later global declarations.
+	r.resolveStaticUses()
+
 	// At the end of the module, resolve all non-local variable references,
 	// computing closures.
 	// Function bodies may contain forward references to later global declarations.
@@ -176,6 +179,7 @@ func ExprOptions(opts *syntax.FileOptions, expr syntax.Expr, isPredeclared, isUn
 	r := newResolver(opts, nil, isPredeclared, isUniversal)
 	r.expr(expr)
 	r.env.resolveLocalUses()
+	r.resolveStaticUses()
 	r.resolveNonLocalUses(r.env) // globals & universals
 	if len(r.errors) > 0 {
 		return nil, r.errors
@@ -236,6 +240,16 @@ type resolver struct {
 	// isGlobal may be nil.
 	isGlobal, isPredeclared, isUniversal func(name string) bool
 
+	// staticUses records identifiers that occur in type annotations.
+	// They are resolved at the end of the module, like non-local uses,
+	// but are not runtime uses: they do not create cells or free variables.
+	staticUses []use
+
+	// unassigned records top-level variables declared by a var statement
+	// that have not yet been assigned. A var-declared global may be
+	// assigned exactly once.
+	unassigned map[*Binding]bool
+
 	loops   int // number of enclosing for/while loops in current function (or file, if top-level)
 	ifstmts int // number of enclosing if statements loops
 
@@ -265,8 +279,9 @@ type block struct {
 	parent *block // nil for file block
 
 	// In the file (root) block, both these fields are nil.
-	function *Function             // only for function blocks
-	comp     *syntax.Comprehension // only for comprehension blocks
+	function   *Function             // only for function blocks
+	comp       *syntax.Comprehension // only for comprehension blocks
+	typeParams bool                  // only for type parameter blocks
 
 	// bindings maps a name to its binding.
 	// A local binding has an index into its innermost enclosing container's locals array.
@@ -297,6 +312,9 @@ func (b *block) String() string {
 	}
 	if b.comp != nil {
 		return "comprehension block at " + fmt.Sprint(b.comp.Span())
+	}
+	if b.typeParams {
+		return "type parameter block"
 	}
 	return "file block"
 }
@@ -370,7 +388,7 @@ func (r *resolver) bindLocal(id *syntax.Ident) bool {
 }
 
 func (r *resolver) use(id *syntax.Ident) {
-	use := use{id, r.env}
+	use := use{id: id, env: r.env}
 
 	// The spec says that if there is a global binding of a name
 	// then all references to that name in that block refer to the
@@ -457,6 +475,160 @@ func (r *resolver) useToplevel(use use) (bind *Binding) {
 	return bind
 }
 
+// useStatic records an identifier that occurs in a type annotation.
+// Such uses are resolved at the end of the module, but they are not
+// runtime uses: they do not create cells or free variables.
+func (r *resolver) useStatic(id *syntax.Ident) {
+	r.staticUses = append(r.staticUses, use{id: id, env: r.env})
+}
+
+// resolveStaticUses resolves all identifiers that occur in type annotations.
+func (r *resolver) resolveStaticUses() {
+	for _, use := range r.staticUses {
+		r.lookupStatic(use, use.env)
+	}
+}
+
+// lookupStatic resolves the identifier of a static use in the
+// lexically enclosing environment, without creating cells or free
+// variables. Unlike lookupLexical, it does not rewrite the environment.
+func (r *resolver) lookupStatic(use use, env *block) *Binding {
+	if env == r.file {
+		return r.useToplevel(use)
+	}
+	if bind, ok := env.bindings[use.id.Name]; ok {
+		use.id.Binding = bind
+		return bind
+	}
+	return r.lookupStatic(use, env.parent)
+}
+
+// typeExpr resolves the identifiers in a type expression.
+func (r *resolver) typeExpr(e syntax.Expr) {
+	switch e := e.(type) {
+	case *syntax.Ident:
+		r.useStatic(e)
+
+	case *syntax.Literal:
+		// string or int literal type argument
+
+	case *syntax.EllipsisExpr:
+		// ...
+
+	case *syntax.DotExpr:
+		r.typeExpr(e.X)
+
+	case *syntax.IndexExpr:
+		r.typeExpr(e.X)
+		r.typeExpr(e.Y)
+
+	case *syntax.BinaryExpr:
+		if e.Op != syntax.PIPE {
+			r.errorf(e.OpPos, "invalid operator in type expression: %s", e.Op)
+			return
+		}
+		r.typeExpr(e.X)
+		r.typeExpr(e.Y)
+
+	case *syntax.ParenExpr:
+		r.typeExpr(e.X)
+
+	case *syntax.TupleExpr:
+		for _, x := range e.List {
+			r.typeExpr(x)
+		}
+
+	case *syntax.ListExpr:
+		for _, x := range e.List {
+			r.typeExpr(x)
+		}
+
+	case *syntax.DictExpr:
+		for _, entry := range e.List {
+			if entry, ok := entry.(*syntax.DictEntry); ok {
+				r.typeExpr(entry.Value)
+			}
+		}
+
+	case *syntax.DictEntry:
+		r.typeExpr(e.Value)
+
+	default:
+		r.errorf(syntax.Start(e), "invalid type expression")
+	}
+}
+
+// bindTypeParam binds a type parameter in the current type parameter block.
+func (r *resolver) bindTypeParam(id *syntax.Ident) {
+	if bind, ok := r.env.bindings[id.Name]; ok {
+		r.errorf(id.NamePos, "duplicate type parameter: %s", id.Name)
+		id.Binding = bind
+		return
+	}
+	bind := &Binding{First: id, Scope: TypeParam}
+	r.env.bind(id.Name, bind)
+	id.Binding = bind
+}
+
+// defAnnotations resolves the type annotations of a function definition.
+func (r *resolver) defAnnotations(def *syntax.DefStmt) {
+	for _, param := range def.Params {
+		switch param := param.(type) {
+		case *syntax.Ident:
+			if param.Type != nil {
+				r.typeExpr(param.Type)
+			}
+		case *syntax.BinaryExpr:
+			if id, ok := param.X.(*syntax.Ident); ok && id.Type != nil {
+				r.typeExpr(id.Type)
+			}
+		case *syntax.UnaryExpr:
+			if id, ok := param.X.(*syntax.Ident); ok && id.Type != nil {
+				r.typeExpr(id.Type)
+			}
+		}
+	}
+	if def.ReturnType != nil {
+		r.typeExpr(def.ReturnType)
+	}
+}
+
+// isParameterizedCollectionType reports whether the type expression
+// denotes a collection type with element, key, or value types,
+// as in list[int] or dict[str, int].
+func isParameterizedCollectionType(e syntax.Expr) bool {
+	switch e := e.(type) {
+	case *syntax.ParenExpr:
+		return isParameterizedCollectionType(e.X)
+	case *syntax.BinaryExpr:
+		return e.Op == syntax.PIPE &&
+			(isParameterizedCollectionType(e.X) || isParameterizedCollectionType(e.Y))
+	case *syntax.IndexExpr:
+		return isCollectionTypeName(e.X)
+	}
+	return false
+}
+
+func isCollectionTypeName(e syntax.Expr) bool {
+	switch e := e.(type) {
+	case *syntax.ParenExpr:
+		return isCollectionTypeName(e.X)
+	case *syntax.Ident:
+		switch e.Name {
+		case "list", "dict", "set", "tuple":
+			return true
+		}
+	case *syntax.DotExpr:
+		if e.Name != nil {
+			switch e.Name.Name {
+			case "list", "dict", "set", "tuple":
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // spellcheck returns the most likely misspelling of
 // the name use.id in the environment use.env.
 func (r *resolver) spellcheck(use use) string {
@@ -464,7 +636,12 @@ func (r *resolver) spellcheck(use use) string {
 
 	// locals
 	for b := use.env; b != nil; b = b.parent {
-		for name := range b.bindings {
+		for name, bind := range b.bindings {
+			// Type parameters are not values, so they cannot be
+			// suggested as corrections for a value name.
+			if bind.Scope == TypeParam {
+				continue
+			}
 			names = append(names, name)
 		}
 	}
@@ -525,10 +702,59 @@ func (r *resolver) stmt(stmt syntax.Stmt) {
 	case *syntax.AssignStmt:
 		r.expr(stmt.RHS)
 		isAugmented := stmt.Op != syntax.EQ
-		r.assign(stmt.LHS, isAugmented)
+		if id, ok := stmt.LHS.(*syntax.Ident); ok && !isAugmented && id.Type != nil {
+			// Typed assignment: a declaration and an assignment.
+			r.typeExpr(id.Type)
+			existed := r.bind(id)
+			if existed && (r.env != r.file || r.options.GlobalReassign) {
+				r.errorf(id.NamePos, "type annotation on %s may only appear at its first declaration", id.Name)
+			}
+			break
+		}
+		r.assignStmt(stmt.LHS, isAugmented)
+
+	case *syntax.VarStmt:
+		if stmt.Name.Type != nil {
+			r.typeExpr(stmt.Name.Type)
+		}
+		existed := r.bind(stmt.Name)
+		if existed && (r.env != r.file || r.options.GlobalReassign) {
+			r.errorf(stmt.Name.NamePos, "type annotation on %s may only appear at its first declaration", stmt.Name.Name)
+		}
+		if !existed && r.env == r.file {
+			if bind, ok := stmt.Name.Binding.(*Binding); ok {
+				if r.unassigned == nil {
+					r.unassigned = make(map[*Binding]bool)
+				}
+				r.unassigned[bind] = true
+			}
+		}
+
+	case *syntax.TypeAliasStmt:
+		if r.container().function != nil || r.loops > 0 || r.ifstmts > 0 {
+			r.errorf(stmt.TypePos, "type alias statement not within top level")
+		}
+		r.bind(stmt.Name)
+		if len(stmt.TypeParams) > 0 {
+			r.push(&block{typeParams: true})
+			for _, param := range stmt.TypeParams {
+				r.bindTypeParam(param)
+			}
+		}
+		r.typeExpr(stmt.Value)
+		if len(stmt.TypeParams) > 0 {
+			r.pop()
+		}
 
 	case *syntax.DefStmt:
 		r.bind(stmt.Name)
+		if len(stmt.TypeParams) > 0 {
+			r.push(&block{typeParams: true})
+			for _, param := range stmt.TypeParams {
+				r.bindTypeParam(param)
+			}
+		}
+		r.defAnnotations(stmt)
 		fn := &Function{
 			Name:   stmt.Name.Name,
 			Pos:    stmt.Def,
@@ -537,6 +763,9 @@ func (r *resolver) stmt(stmt syntax.Stmt) {
 		}
 		stmt.Function = fn
 		r.function(fn, stmt.Def)
+		if len(stmt.TypeParams) > 0 {
+			r.pop()
+		}
 
 	case *syntax.ForStmt:
 		if !r.options.TopLevelControl && r.container().function == nil {
@@ -605,9 +834,27 @@ func (r *resolver) stmt(stmt syntax.Stmt) {
 }
 
 func (r *resolver) assign(lhs syntax.Expr, isAugmented bool) {
+	r.assignTarget(lhs, isAugmented, false)
+}
+
+// assignStmt resolves the target of an assignment statement.
+// Unlike other assignments, the first assignment to a var-declared
+// global is permitted.
+func (r *resolver) assignStmt(lhs syntax.Expr, isAugmented bool) {
+	r.assignTarget(lhs, isAugmented, true)
+}
+
+func (r *resolver) assignTarget(lhs syntax.Expr, isAugmented, isStmt bool) {
 	switch lhs := lhs.(type) {
 	case *syntax.Ident:
 		// x = ...
+		if isStmt && !isAugmented && r.env == r.file {
+			if bind, ok := r.globals[lhs.Name]; ok && r.unassigned[bind] {
+				lhs.Binding = bind
+				delete(r.unassigned, bind)
+				return
+			}
+		}
 		r.bind(lhs)
 
 	case *syntax.IndexExpr:
@@ -625,7 +872,7 @@ func (r *resolver) assign(lhs syntax.Expr, isAugmented bool) {
 			r.errorf(syntax.Start(lhs), "can't use tuple expression in augmented assignment")
 		}
 		for _, elem := range lhs.List {
-			r.assign(elem, isAugmented)
+			r.assignTarget(elem, isAugmented, isStmt)
 		}
 
 	case *syntax.ListExpr:
@@ -634,11 +881,11 @@ func (r *resolver) assign(lhs syntax.Expr, isAugmented bool) {
 			r.errorf(syntax.Start(lhs), "can't use list expression in augmented assignment")
 		}
 		for _, elem := range lhs.List {
-			r.assign(elem, isAugmented)
+			r.assignTarget(elem, isAugmented, isStmt)
 		}
 
 	case *syntax.ParenExpr:
-		r.assign(lhs.X, isAugmented)
+		r.assignTarget(lhs.X, isAugmented, isStmt)
 
 	default:
 		name := strings.ToLower(strings.TrimPrefix(fmt.Sprintf("%T", lhs), "*syntax."))
@@ -811,6 +1058,22 @@ func (r *resolver) expr(e syntax.Expr) {
 	case *syntax.ParenExpr:
 		r.expr(e.X)
 
+	case *syntax.CastExpr:
+		r.expr(e.X)
+		r.typeExpr(e.Type)
+
+	case *syntax.IsInstanceExpr:
+		r.expr(e.X)
+		r.typeExpr(e.Type)
+		if isParameterizedCollectionType(e.Type) {
+			r.errorf(syntax.Start(e.Type), "isinstance cannot be used with parameterized collection types")
+		} else {
+			r.errorf(e.IsInstance, "isinstance expressions are not supported yet")
+		}
+
+	case *syntax.EllipsisExpr:
+		r.errorf(e.Ellipsis, "unexpected ellipsis")
+
 	default:
 		log.Panicf("unexpected expr %T", e)
 	}
@@ -964,6 +1227,11 @@ func (r *resolver) lookupLexical(use use, env *block) (bind *Binding) {
 
 	// Defined in this block?
 	bind, ok := env.bindings[use.id.Name]
+	if ok && bind.Scope == TypeParam {
+		// A type parameter is not a runtime binding, but it may
+		// shadow a value binding in an enclosing block. Keep looking.
+		return r.lookupLexical(use, env.parent)
+	}
 	if !ok {
 		// Defined in parent block?
 		bind = r.lookupLexical(use, env.parent)

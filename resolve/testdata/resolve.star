@@ -393,3 +393,161 @@ load("module", "x") # ok
 ---
 _ = x # forward ref to file-local
 load("module", "x") # ok
+
+---
+# option:typeannotations
+def f(x: M, y: float) -> M:
+    return x
+
+def g(x: str) -> None:
+    pass
+
+---
+# option:typeannotations
+def f(x: NoSuchType): pass ### "undefined: NoSuchType"
+
+---
+# option:typeannotations
+def f[T](x: T) -> T:
+    y: T = x
+    return y
+
+---
+# option:typeannotations
+def f[T](x: T):
+    return T ### "undefined: T$"
+
+---
+# option:typeannotations
+def f[T, T](x: T): pass ### "duplicate type parameter: T"
+
+---
+# option:typeannotations
+def f():
+    x = 1
+    x: float = 2 ### "type annotation on x may only appear at its first declaration"
+
+---
+# option:typeannotations
+x = 1
+x: float = 2 ### "cannot reassign global x"
+
+---
+# option:typeannotations option:globalreassign
+x = 1
+x: float = 2 ### "type annotation on x may only appear at its first declaration"
+
+---
+# option:typeannotations
+def f():
+    x: float
+    x: float ### "type annotation on x may only appear at its first declaration"
+
+---
+# option:typeannotations
+x: float
+x = 1
+_ = x
+
+---
+# option:typeannotations
+x: float
+x = 1
+x = 2 ### "cannot reassign global x"
+
+---
+# option:typeannotations
+x: float
+x, y = 1, 2
+
+---
+# option:typeannotations
+x: float
+(x) = 1
+
+---
+# option:typeannotations
+x: float
+x, y = 1, 2
+x = 3 ### "cannot reassign global x"
+
+---
+# option:typeannotations
+def f():
+    x: float
+    return x
+
+---
+# option:typeannotations
+type Numeric = float | int
+def f(x: Numeric) -> Numeric:
+    return x
+
+---
+# option:typeannotations
+type Pair[K, V] = dict[K, V]
+def f(x: Pair[str, int]): pass
+
+---
+# option:typeannotations
+def f():
+    type X = float ### "type alias statement not within top level"
+
+---
+# option:typeannotations option:toplevelcontrol
+if True:
+    type X = float ### "type alias statement not within top level"
+
+---
+# option:typeannotations
+type X = float
+type X = int ### "cannot reassign global X"
+
+---
+# option:typeannotations
+def f(x: Later): pass
+type Later = float
+
+---
+# option:typeannotations
+def f(x: list[int], y: dict[str, int], z: tuple[int, ...]): pass
+
+---
+# option:typeannotations
+def f(x: float) -> float:
+    return cast(float, x)
+
+---
+# option:typeannotations
+def f(x: float):
+    return cast(NoSuchType, x) ### "undefined: NoSuchType"
+
+---
+# option:typeannotations
+type T = float
+def f(x: float) -> float:
+    return cast(T, x)
+
+---
+# option:typeannotations
+_ = isinstance(1, float) ### "isinstance expressions are not supported yet"
+
+---
+# option:typeannotations
+_ = isinstance([], list[int]) ### "isinstance cannot be used with parameterized collection types"
+
+---
+# option:typeannotations
+_ = isinstance(None, float | list[int]) ### "isinstance cannot be used with parameterized collection types"
+
+---
+# Type-only names are not special: they resolve like value names.
+# option:typeannotations
+def f(x: string): pass ### "undefined: string"
+y = string ### "undefined: string"
+
+---
+# option:typeannotations
+def f(x: NoneType): pass ### "undefined: NoneType"
+def g():
+    return function ### "undefined: function"

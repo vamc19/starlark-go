@@ -29,7 +29,7 @@ type FileOptions struct {
 	LoadBindsGlobally bool // load creates global not file-local bindings (deprecated)
 
 	// parser
-	TypeAnnotations bool // parse type annotations (resolver/compiler support is not yet implemented)
+	TypeAnnotations bool // parse type annotations (runtime support is not yet implemented)
 
 	// compiler
 	Recursion bool // disable recursion check for functions in this file

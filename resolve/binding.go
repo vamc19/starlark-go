@@ -20,10 +20,10 @@ type Binding struct {
 	// - {DefStmt,File}.Locals, if Scope==Local
 	// - DefStmt.FreeVars,      if Scope==Free
 	// - File.Globals,          if Scope==Global.
-	// It is zero if Scope is Predeclared, Universal, or Undefined.
+	// It is zero if Scope is Predeclared, Universal, TypeParam, or Undefined.
 	Index int
 
-	First *syntax.Ident // first binding use (iff Scope==Local/Free/Global)
+	First *syntax.Ident // first binding use (iff Scope==Local/Free/Global/TypeParam)
 }
 
 // The Scope of Binding indicates what kind of scope it has.
@@ -37,6 +37,7 @@ const (
 	Global                   // name is global to module
 	Predeclared              // name is predeclared for this module (e.g. glob)
 	Universal                // name is universal (e.g. len)
+	TypeParam                // name is a type parameter
 )
 
 var scopeNames = [...]string{
@@ -47,6 +48,7 @@ var scopeNames = [...]string{
 	Global:      "global",
 	Predeclared: "predeclared",
 	Universal:   "universal",
+	TypeParam:   "type parameter",
 }
 
 func (scope Scope) String() string { return scopeNames[scope] }
